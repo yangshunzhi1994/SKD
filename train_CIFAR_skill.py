@@ -25,37 +25,48 @@ from torch.utils.data.distributed import DistributedSampler
 parser = argparse.ArgumentParser(description='PyTorch Teacher CNN Training')
 parser.add_argument('--save_root', type=str, default='results/', help='models and logs are saved here')
 parser.add_argument('--tmodel', type=str, default="resnet56", help='resnet56,resnet34, Vgg13')
-parser.add_argument('--data_name', type=str, default="CIFAR100", help='CIFAR100,TinyImageNet')
+parser.add_argument('--data_name', type=str, default="CIFAR100", help='CIFAR100,TinyImageNet,ImageNet')
 parser.add_argument('--epochs', type=int, default=12, help='number of total epochs to run')
 parser.add_argument('--num_workers', type=int, default=0, help='num_workers')
 parser.add_argument('--N_Teacher', default=6, type=int, help='How many epoch states of the teacher network '
                                                               'are used to predict its next action.')
-parser.add_argument("--local_rank", type=int, default=0)
 parser.add_argument('--train_bs', default=256, type=int, help='learning rate')
 parser.add_argument('--test_bs', default=256, type=int, help='learning rate')
+
+# Distributed training
+parser.add_argument("--local_rank", type=int, default=0)
+parser.add_argument('--master_port', default=24400, type=int, help='master port for distributed')
+parser.add_argument('--gpu_num', type=int, default=1, help='gpu_num')
 args = parser.parse_args()
 
 best_Meta_loss = 100
 best_Shortcut_loss = 100
 
-torch.distributed.init_process_group(backend="nccl")
-local_rank = torch.distributed.get_rank()
-print('local_rank', local_rank)
-torch.cuda.set_device(local_rank)
-device = torch.device("cuda", local_rank)
-
-if args.train_bs == 512:
-    LR = 0.4
-elif args.train_bs == 256:
-    LR = 0.2
-elif args.train_bs == 128:
-    LR = 0.1
-else:
-    LR = 0.05
 LR_DECAY_STAGES = [3, 6, 9]
 LR_DECAY_RATE = 0.1
-WEIGHT_DECAY = 0.0005
+WEIGHT_DECAY = 5e-4
 MOMENTUM = 0.9
+
+if args.data_name == 'CIFAR100' or args.data_name == 'TinyImageNet':
+    if args.train_bs == 256:
+        LR = 0.2
+    elif args.train_bs == 128:
+        LR = 0.1
+    else:
+        raise NotImplementedError(args.train_bs)
+else:
+    if args.train_bs == 512:
+        LR = 0.2
+    else:
+        raise NotImplementedError(args.train_bs)
+
+os.environ['MASTER_ADDR'] = '127.0.0.1'
+os.environ['MASTER_PORT'] = str(args.master_port)
+args.gpu_num = int(os.environ['WORLD_SIZE'])
+torch.distributed.init_process_group(backend="nccl")
+args.train_bs = int(args.train_bs / args.gpu_num)
+args.test_bs = int(args.train_bs / args.gpu_num / 2)
+torch.cuda.set_device(args.local_rank)
 
 if args.data_name == 'CIFAR100':
     NUM_CLASSES = 100
@@ -65,7 +76,7 @@ if args.data_name == 'CIFAR100':
                                      batch_size=args.train_bs, shuffle=True, distributed=True)
     testloader = get_test_CIFAR100(CIFAR100_TRAIN_MEAN, CIFAR100_TRAIN_STD, num_workers=args.num_workers,
                                    batch_size=args.test_bs, shuffle=False, distributed=True)
-else:
+elif args.data_name == 'TinyImageNet':
     NUM_CLASSES = 200
     # traindir = os.path.join('datasets/tiny-imagenet-200/', 'train.lmdb')
     # valdir = os.path.join('datasets/tiny-imagenet-200/', 'val.lmdb')
@@ -89,11 +100,37 @@ else:
                                               pin_memory=True, sampler=DistributedSampler(trainset))
     testloader = torch.utils.data.DataLoader(testset, num_workers=args.num_workers, batch_size=args.test_bs,
                                              shuffle=False, pin_memory=True, sampler=DistributedSampler(testset))
+elif args.data_name == 'Imagenet':
+    NUM_CLASSES = 1000
+    traindir = os.path.join('/dev/shm/Imagenet_lmdb/', 'train.lmdb')
+    valdir = os.path.join('/dev/shm/Imagenet_lmdb/', 'val.lmdb')
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    trainset = ImageFolderLMDB(
+        traindir,
+        transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ]))
+    testset = ImageFolderLMDB(
+        valdir,
+        transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ]))
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_bs, pin_memory=True, sampler=DistributedSampler(trainset))
+    testloader = torch.utils.data.DataLoader(testset, batch_size=args.test_bs, shuffle=False, pin_memory=True, sampler=DistributedSampler(testset))
+else:
+    raise Exception('.............Invalid..data_name............')
+
 
 ShortcutPrediction = losses.Shortcut(args.N_Teacher, nf=64, future_step=4)
-ShortcutPrediction.to(device)
-ShortcutPrediction = torch.nn.parallel.DistributedDataParallel(ShortcutPrediction, device_ids=[local_rank],
-                                                               output_device=local_rank)
+ShortcutPrediction.cuda()
+ShortcutPrediction = torch.nn.parallel.DistributedDataParallel(ShortcutPrediction, device_ids=[args.local_rank],
+                                                               output_device=args.local_rank)
 
 if args.tmodel == 'resnet56' or args.tmodel == 'Vgg13':
 
@@ -104,12 +141,12 @@ if args.tmodel == 'resnet56' or args.tmodel == 'Vgg13':
         ExperiencePrediction1 = EncoderDecoderConvLSTM(in_chan=128, nf=256, future_step=4)
         ExperiencePrediction2 = EncoderDecoderConvLSTM(in_chan=256, nf=512, future_step=4)
 
-    ExperiencePrediction1.to(device)
-    ExperiencePrediction2.to(device)
-    ExperiencePrediction1 = torch.nn.parallel.DistributedDataParallel(ExperiencePrediction1, device_ids=[local_rank],
-                                                                      output_device=local_rank)
-    ExperiencePrediction2 = torch.nn.parallel.DistributedDataParallel(ExperiencePrediction2, device_ids=[local_rank],
-                                                                      output_device=local_rank)
+    ExperiencePrediction1.cuda()
+    ExperiencePrediction2.cuda()
+    ExperiencePrediction1 = torch.nn.parallel.DistributedDataParallel(ExperiencePrediction1, device_ids=[args.local_rank],
+                                                                      output_device=args.local_rank)
+    ExperiencePrediction2 = torch.nn.parallel.DistributedDataParallel(ExperiencePrediction2, device_ids=[args.local_rank],
+                                                                      output_device=args.local_rank)
     MSE_criterion = nn.MSELoss().cuda()
     MetaLearner_optimizer = optim.SGD(itertools.chain(ExperiencePrediction1.parameters(),
                             ExperiencePrediction2.parameters()), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
