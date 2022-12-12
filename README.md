@@ -1,2 +1,2 @@
-# SKD
-A Skill-based Knowledge Distillation Method
+# TSKD
+A Transferring Skills Knowledge Distillation Method
